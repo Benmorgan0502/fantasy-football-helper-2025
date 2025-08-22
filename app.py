@@ -1,32 +1,27 @@
-# Fantasy Draft Helper — Streamlit app
-# ---------------------------------------------------
-# Use this single-file app with your 2025 fantasy CSVs.
-# Place these files in your repo (root or ./data):
-#   QB_RANKINGS.csv, RB_RANKINGS.csv, WR_RANKINGS.csv,
-#   TE_RANKINGS.csv, DST_RANKINGS.csv, K_RANKINGS.csv
-# Then run:  streamlit run app.py   (or whatever you name this file)
+# Fantasy Draft Helper — Streamlit app (with League Setup & Keeper Line 0)
+# ---------------------------------------------------------------------
+# New features per request:
+# - League Setup tab: enter 10 team names & draft order (slots 1..10).
+# - For each team, specify an optional keeper ("Name" or "Name (POS)").
+# - Draft Board shows a locked **Pick 0** row per team for keepers.
+#     • If a keeper is provided and matched, that player is auto-marked drafted.
+#     • If no keeper yet, placeholder remains on Pick 0 and does NOT affect availability.
+# - Players marked as keepers are removed from Best Available / By Position.
+# - Draft order panel renders on the Draft Board.
+# - Optional auto-assign of "picker" by draft order (linear or snake).
+# - State save/load includes league config & keepers.
 #
-# Features:
-# - Load 6 position ranking CSVs and normalize columns
-# - Show Best Available (all positions) + By Position views
-# - Quickly mark players as drafted (others or yours)
-# - Pre-load keepers (paste names) — Tee Higgins preselected for you
-# - Queue/star players you like
-# - Draft board with undo
-# - Save/Load state to/from JSON (so you can persist mid-draft)
-#
-# Notes:
-# - If your CSV column names differ, the loader tries to auto-detect
-#   common variants ("Player", "Name", "Team", "Bye", "Rank", etc.).
-# - If an overall rank column isn’t found, the app builds a cross-position
-#   "overall_approx" using each position’s rank percentile.
-# - This is offline-only and does not depend on ESPN/Sleeper APIs.
+# How to run:
+#   1) Put CSVs in repo root or ./data: QB_RANKINGS.csv, RB_RANKINGS.csv, WR_RANKINGS.csv,
+#      TE_RANKINGS.csv, DST_RANKINGS.csv, K_RANKINGS.csv
+#   2) pip install streamlit pandas
+#   3) streamlit run app.py
 
 from __future__ import annotations
 import json
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -40,25 +35,21 @@ st.set_page_config(
     layout="wide",
 )
 
-HIDE_INDEX_CSS = """
+CSS = """
 <style>
-    .block-container {padding-top: 1.6rem;}
-    .stDataFrame td, .stDataFrame th {font-size: 0.95rem;}
-    .small-note {color: #7a7a7a; font-size: 0.88rem;}
-    .tag {display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #e3e3e3; margin-right: 6px; font-size: 0.8rem;}
-    .tag.good {background: #eef8ee;}
-    .tag.warn {background: #fff6ea;}
-    .pill {display:inline-block; padding: 3px 10px; border-radius: 9999px; border:1px solid #e5e7eb; font-size:0.82rem;}
-    .queue-row {background: rgba(255, 235, 59, 0.12);} /* subtle yellow */
+  .block-container {padding-top: 1.2rem;}
+  .stDataFrame td, .stDataFrame th {font-size: 0.95rem;}
+  .small-note {color: #7a7a7a; font-size: 0.88rem;}
+  .tag {display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #e3e3e3; margin-right:6px; font-size:0.8rem;}
+  .pill {display:inline-block; padding:3px 10px; border-radius: 9999px; border:1px solid #e5e7eb; font-size:0.82rem;}
+  .keeper-row {background: rgba(76, 175, 80, 0.08);} /* subtle green */
 </style>
 """
-st.markdown(HIDE_INDEX_CSS, unsafe_allow_html=True)
+st.markdown(CSS, unsafe_allow_html=True)
 
 # ----------------------------
-# Helpers
+# CSV discovery & normalization
 # ----------------------------
-
-# Common synonyms for column detection
 NAME_COLS = ["player", "name", "player name", "player_name"]
 TEAM_COLS = ["team", "tm"]
 BYE_COLS  = ["bye", "bye week", "bye_week", "byeweek"]
@@ -74,7 +65,6 @@ POS_FILES = {
     "K": "K_RANKINGS.csv",
 }
 
-# Try both repo root and ./data
 SEARCH_DIRS = [".", "./data", "./Data", "./datasets", "./rankings"]
 
 
@@ -82,7 +72,6 @@ def _find_first_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     cols_lower = [c.lower().strip() for c in cols]
     for cand in candidates:
         if cand in cols_lower:
-            # Return the original column name with matching index
             return cols[cols_lower.index(cand)]
     return None
 
@@ -124,50 +113,39 @@ def normalize_one_position(path: str, pos: str) -> pd.DataFrame:
     df = raw.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    # Coalesce common columns
     name_col = _coalesce_columns(df, NAME_COLS, "player")
     team_col = _coalesce_columns(df, TEAM_COLS, "team")
     bye_col  = _coalesce_columns(df, BYE_COLS,  "bye")
 
-    # Create position & source metadata
     df["pos"] = pos
     df["source_file"] = os.path.basename(path)
 
-    # Position rank: use explicit if present, else index+1
     pos_rank_col = _find_first_col(list(df.columns), POS_RANK_COLS)
     if pos_rank_col is None:
         df["pos_rank"] = range(1, len(df) + 1)
     else:
         if pos_rank_col != "pos_rank":
             df.rename(columns={pos_rank_col: "pos_rank"}, inplace=True)
-        # Clean numeric
         df["pos_rank"] = pd.to_numeric(df["pos_rank"], errors="coerce")
 
-    # Overall (cross-position) if present
     overall_col = _find_first_col(list(df.columns), RANK_COLS)
     if overall_col is not None and overall_col != "overall":
         df.rename(columns={overall_col: "overall"}, inplace=True)
     if "overall" in df.columns:
         df["overall"] = pd.to_numeric(df["overall"], errors="coerce")
 
-    # Ensure essential cols exist
     if "player" not in df.columns:
-        # Try to build from first column if totally unknown
-        first = df.columns[0]
-        df.rename(columns={first: "player"}, inplace=True)
+        df.rename(columns={df.columns[0]: "player"}, inplace=True)
     if "team" not in df.columns:
         df["team"] = ""
     if "bye" not in df.columns:
         df["bye"] = ""
 
-    # Trim & clean
     df["player"] = df["player"].astype(str).str.strip()
     df["team"] = df["team"].astype(str).str.upper().str.strip()
     df["bye"] = df["bye"].astype(str).str.strip()
 
-    # Drop rows without player names
     df = df[df["player"].str.len() > 0].copy()
-
     return df
 
 
@@ -179,34 +157,25 @@ def load_all_positions(files: Dict[str, str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["player", "team", "bye", "pos", "pos_rank", "overall", "source_file"])  # empty
     all_df = pd.concat(frames, ignore_index=True)
 
-    # Build a cross-position approximation if overall not widely present
     if all_df["overall"].notna().sum() < len(all_df) * 0.5:
         all_df["pos_count"] = all_df.groupby("pos")["player"].transform("count")
         all_df["pos_percentile"] = all_df["pos_rank"] / all_df["pos_count"]
-        # Lower is better; fallback to percentile “overall_approx”
         all_df["overall_approx"] = all_df["pos_percentile"]
     else:
-        # Normalize given overall into 0..1 for cross-position sort consistency
-        # Smaller is better
         max_overall = all_df["overall"].max()
         all_df["overall_approx"] = all_df["overall"] / max_overall
 
-    # Player stable id (handles dup names across positions)
     all_df["player_id"] = (
         all_df["player"].str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
         + "|" + all_df["pos"].str.upper()
     )
 
-    # Ensure numeric
     all_df["pos_rank"] = pd.to_numeric(all_df["pos_rank"], errors="coerce")
-
-    # Sort default: best to worst
     all_df.sort_values(["overall_approx", "pos", "pos_rank"], inplace=True, ignore_index=True)
     return all_df
 
-
 # ----------------------------
-# Session state init
+# Session State & League Model
 # ----------------------------
 
 def init_state():
@@ -214,261 +183,282 @@ def init_state():
         files = discover_files()
         st.session_state.players = load_all_positions(files)
     if "drafted" not in st.session_state:
-        st.session_state.drafted: List[dict] = []
-    if "queue" not in st.session_state:
-        st.session_state.queue: set[str] = set()
+        st.session_state.drafted: List[dict] = []  # includes keepers with pick_no==0
     if "pick_no" not in st.session_state:
         st.session_state.pick_no = 1
-    if "preloaded_tee" not in st.session_state:
-        st.session_state.preloaded_tee = False
-    if "num_teams" not in st.session_state:
-        st.session_state.num_teams = 10
-    if "default_picker" not in st.session_state:
-        st.session_state.default_picker = "Other Team"
-
+    if "league" not in st.session_state:
+        st.session_state.league = {
+            "num_teams": 10,
+            "teams": [
+                {"slot": i+1, "team_name": f"Team {i+1}", "keeper_text": "", "keeper_pid": None}
+                for i in range(10)
+            ],
+            "snake": True,
+            "auto_assign_picker": False,
+        }
 
 init_state()
-players = st.session_state.players
+players: pd.DataFrame = st.session_state.players
 
-# ----------------------------
-# Utilities for draft actions
-# ----------------------------
+# Utility: map -> drafted set
 
-PLAYER_COLUMNS_VIEW = [
-    "player", "team", "pos", "pos_rank", "bye"
-]
+def drafted_ids_set() -> set:
+    return {d["player_id"] for d in st.session_state.drafted if d.get("player_id")}
 
+# Keeper matching & application
+
+def parse_name_pos(s: str) -> Tuple[str, Optional[str]]:
+    m = re.match(r"^(.*?)(\s*\((QB|RB|WR|TE|DST|K)\))?$", s.strip(), flags=re.I)
+    if not m:
+        return s.strip(), None
+    name = m.group(1).strip()
+    pos = (m.group(3) or None)
+    return name, (pos.upper() if pos else None)
+
+
+def find_available_player(name: str, pos: Optional[str]) -> Optional[pd.Series]:
+    df = players.copy()
+    # exclude already drafted
+    df = df[~df["player_id"].isin(drafted_ids_set())]
+    cand = df[df["player"].str.lower() == name.lower()]
+    if pos:
+        cand = cand[cand["pos"].str.upper() == pos]
+    if cand.empty:
+        cand = df[df["player"].str.lower().str.contains(name.lower())]
+        if pos:
+            cand = cand[cand["pos"].str.upper() == pos]
+    if cand.empty:
+        return None
+    row = cand.sort_values(["overall_approx", "pos_rank"]).iloc[0]
+    return row
+
+# Draft mechanics
 
 def is_drafted(player_id: str) -> bool:
-    return any(pick["player_id"] == player_id for pick in st.session_state.drafted)
+    return any(p.get("player_id") == player_id for p in st.session_state.drafted)
 
 
-def add_to_queue(player_id: str):
-    st.session_state.queue.add(player_id)
+def compute_picker_for_pick(pick_no: int) -> str:
+    teams = sorted(st.session_state.league["teams"], key=lambda t: t["slot"])  # in slot order
+    N = len(teams)
+    if N == 0:
+        return "Other Team"
+    round_idx = (pick_no - 1) // N  # 0-based
+    idx_in_round = (pick_no - 1) % N
+    if st.session_state.league.get("snake", True) and (round_idx % 2 == 1):
+        team = teams[::-1][idx_in_round]
+    else:
+        team = teams[idx_in_round]
+    return team.get("team_name", f"Team {idx_in_round+1}")
 
 
-def remove_from_queue(player_id: str):
-    st.session_state.queue.discard(player_id)
-
-
-def mark_drafted(player_row: pd.Series, picker: str, method: str = "manual"):
-    pid = player_row["player_id"]
+def mark_drafted(row: pd.Series, picker: Optional[str] = None, method: str = "manual", pick_no: Optional[int] = None):
+    pid = row["player_id"]
     if is_drafted(pid):
         return
+    if pick_no is None:
+        pick_no = st.session_state.pick_no
+    if picker is None:
+        picker = compute_picker_for_pick(pick_no) if st.session_state.league.get("auto_assign_picker", False) else "Other Team"
     st.session_state.drafted.append({
-        "pick_no": st.session_state.pick_no,
+        "pick_no": pick_no,
         "player_id": pid,
-        "player": player_row.get("player", ""),
-        "team": player_row.get("team", ""),
-        "pos": player_row.get("pos", ""),
+        "player": row.get("player", ""),
+        "team": row.get("team", ""),
+        "pos": row.get("pos", ""),
         "picker": picker,
         "method": method,
     })
-    st.session_state.pick_no += 1
-    # If they were in queue, remove
-    remove_from_queue(pid)
+    if pick_no > 0:
+        st.session_state.pick_no = max(st.session_state.pick_no, pick_no + 1)
 
 
 def undo_last_pick():
-    if st.session_state.drafted:
-        last = st.session_state.drafted.pop()
-        st.session_state.pick_no = max(1, last["pick_no"])  # revert counter to last
+    # Do not remove keeper placeholders or keeper picks at pick 0
+    while st.session_state.drafted:
+        last = st.session_state.drafted[-1]
+        if last.get("pick_no", 0) == 0:
+            # keepers are locked — skip
+            st.session_state.drafted.pop()
+            # reinsert at beginning to maintain order
+            st.session_state.drafted.insert(0, last)
+            break
+        st.session_state.drafted.pop()
+        # adjust counter
+        st.session_state.pick_no = max(1, last.get("pick_no", 1))
+        break
 
+# Save / Load
 
 def save_state_json() -> str:
     payload = {
         "drafted": st.session_state.drafted,
         "pick_no": st.session_state.pick_no,
-        "queue": list(st.session_state.queue),
-        "num_teams": st.session_state.num_teams,
-        "default_picker": st.session_state.default_picker,
+        "league": st.session_state.league,
     }
     return json.dumps(payload, indent=2)
 
 
 def load_state_json(text: str):
-    try:
-        data = json.loads(text)
-        st.session_state.drafted = data.get("drafted", [])
-        st.session_state.pick_no = int(data.get("pick_no", 1))
-        st.session_state.queue = set(data.get("queue", []))
-        st.session_state.num_teams = int(data.get("num_teams", 10))
-        st.session_state.default_picker = data.get("default_picker", "Other Team")
-        st.success("State loaded.")
-    except Exception as e:
-        st.error(f"Failed to load state: {e}")
-
+    data = json.loads(text)
+    st.session_state.drafted = data.get("drafted", [])
+    st.session_state.pick_no = int(data.get("pick_no", 1))
+    st.session_state.league = data.get("league", st.session_state.league)
+    st.success("State loaded.")
 
 # ----------------------------
-# Sidebar: Settings & Keepers
+# Apply League Setup & Keepers
 # ----------------------------
 
+def apply_league_setup(teams_df: pd.DataFrame):
+    # Update league teams
+    teams = []
+    for _, r in teams_df.iterrows():
+        teams.append({
+            "slot": int(r["slot"]),
+            "team_name": str(r["team_name"]).strip() or f"Team {int(r['slot'])}",
+            "keeper_text": str(r.get("keeper", "")).strip(),
+            "keeper_pid": None,
+        })
+    teams.sort(key=lambda t: t["slot"])  # ensure order
+    st.session_state.league["teams"] = teams
+
+    # Build/refresh keeper placeholders at pick 0 (one per team)
+    # Strategy: remove any existing pick_no==0 rows, then recreate from teams
+    st.session_state.drafted = [p for p in st.session_state.drafted if p.get("pick_no", 0) != 0]
+
+    # Add placeholders first
+    for t in teams:
+        st.session_state.drafted.append({
+            "pick_no": 0,
+            "player_id": None,  # placeholder until assigned
+            "player": "— TBD —" if not t["keeper_text"] else t["keeper_text"],
+            "team": "",
+            "pos": "",
+            "picker": t["team_name"],
+            "method": "keeper",
+        })
+
+    # Then, for any team with a keeper name, try to match & lock at pick 0
+    for idx, t in enumerate(teams):
+        kt = t["keeper_text"].strip()
+        if not kt:
+            continue
+        name, pos = parse_name_pos(kt)
+        row = find_available_player(name, pos)
+        if row is None:
+            continue  # leave placeholder text, not drafted
+        # assign to the placeholder record for this team (the nth pick 0 row with same picker)
+        # find the first matching placeholder for picker with player_id None
+        for p in st.session_state.drafted:
+            if p.get("pick_no") == 0 and p.get("picker") == t["team_name"] and p.get("player_id") is None:
+                p.update({
+                    "player_id": row["player_id"],
+                    "player": row["player"],
+                    "team": row["team"],
+                    "pos": row["pos"],
+                })
+                t["keeper_pid"] = row["player_id"]
+                break
+
+# ----------------------------
+# UI — Sidebar
+# ----------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
-    st.session_state.num_teams = st.number_input("Number of teams", min_value=4, max_value=20, step=1, value=st.session_state.num_teams)
-    st.session_state.default_picker = st.text_input("Default picker label for drafts", value=st.session_state.default_picker)
+    st.session_state.league["snake"] = st.toggle("Snake draft", value=st.session_state.league.get("snake", True))
+    st.session_state.league["auto_assign_picker"] = st.toggle("Auto-assign picker by draft order", value=st.session_state.league.get("auto_assign_picker", False))
 
     st.divider()
-    st.subheader("📥 Load / 💾 Save")
+    st.subheader("📥 Load / 💾 Save State")
     c1, c2 = st.columns(2)
     with c1:
-        state_text = save_state_json()
-        st.download_button("💾 Download state JSON", data=state_text, file_name="draft_state.json", mime="application/json")
+        st.download_button("💾 Download JSON", data=save_state_json(), file_name="draft_state.json", mime="application/json")
     with c2:
-        uploaded = st.file_uploader("Upload saved state JSON", type=["json"], label_visibility="collapsed")
+        uploaded = st.file_uploader("Upload JSON", type=["json"], label_visibility="collapsed")
         if uploaded is not None:
             load_state_json(uploaded.read().decode("utf-8"))
 
     st.divider()
-    st.subheader("🧲 Pre-load keepers")
-    st.caption("Paste one player per line. Example: `Tee Higgins`\nYou can include position in parentheses, e.g., `Tee Higgins (WR)`.")
-    keepers_text = st.text_area("Keeper names", value="Tee Higgins", height=100)
-    keeper_picker = st.text_input("Label for keeper picks (your team name)", value="Me (keeper)")
-    if st.button("Mark keepers as drafted"):
-        names = [n.strip() for n in keepers_text.splitlines() if n.strip()]
-        hits, misses = 0, []
-        for name in names:
-            # Optional position in parentheses
-            m = re.match(r"^(.*?)(\s*\((QB|RB|WR|TE|DST|K)\))?$", name, flags=re.I)
-            qname = m.group(1).strip() if m else name
-            qpos = (m.group(3) or "").upper() if m else ""
-
-            # Candidate matches
-            cand = players[players["player"].str.lower() == qname.lower()]
-            if qpos:
-                cand = cand[cand["pos"].str.upper() == qpos]
-            if cand.empty:
-                # fallback: substring contains
-                cand = players[players["player"].str.lower().str.contains(qname.lower())]
-                if qpos:
-                    cand = cand[cand["pos"].str.upper() == qpos]
-            if cand.empty:
-                misses.append(name)
-                continue
-            # Choose the best-ranked among candidates not already drafted
-            cand = cand[~cand["player_id"].isin([d["player_id"] for d in st.session_state.drafted])]
-            if cand.empty:
-                misses.append(name)
-                continue
-            row = cand.sort_values(["overall_approx", "pos_rank"]).iloc[0]
-            mark_drafted(row, picker=keeper_picker, method="keeper")
-            hits += 1
-        if hits:
-            st.success(f"Marked {hits} keeper(s) drafted.")
-        if misses:
-            st.warning("Not found or already drafted: " + ", ".join(misses))
-
-    st.divider()
     st.subheader("🧹 Reset")
-    reset_ok = st.checkbox("I understand this clears all picks", value=False)
-    if st.button("Reset draft state", disabled=not reset_ok):
-        st.session_state.drafted = []
-        st.session_state.queue = set()
-        st.session_state.pick_no = 1
-        st.success("Draft state reset.")
-
-
-# Preload Tee Higgins once if present and not already drafted
-if not st.session_state.preloaded_tee and not any(d["method"] == "keeper" for d in st.session_state.drafted):
-    tee = players[(players["player"].str.lower() == "tee higgins") & (players["pos"] == "WR")]
-    if not tee.empty:
-        mark_drafted(tee.iloc[0], picker="Me (keeper)", method="keeper")
-        st.session_state.preloaded_tee = True
-
+    if st.button("Reset ALL (keep CSVs)"):
+        st.session_state.clear()
+        st.rerun()
 
 # ----------------------------
-# Main layout
+# UI — Main Tabs
 # ----------------------------
-
 st.title("🏈 Fantasy Draft Helper 2025")
 
-# Quick actions row
-qc1, qc2, qc3, qc4 = st.columns([2,2,2,1])
-with qc1:
-    quick_name = st.text_input("Quick draft by name (press Enter)", placeholder="e.g., Puka Nacua or \"Puka Nacua (WR)\"")
-with qc2:
-    quick_picker = st.text_input("Picker label", value=st.session_state.default_picker)
-with qc3:
-    st.write("\n")
-    if st.button("➕ Draft by name") and quick_name.strip():
-        # Reuse keeper matching logic
-        m = re.match(r"^(.*?)(\s*\((QB|RB|WR|TE|DST|K)\))?$", quick_name.strip(), flags=re.I)
-        qname = m.group(1).strip() if m else quick_name.strip()
-        qpos = (m.group(3) or "").upper() if m else ""
-        cand = players[players["player"].str.lower() == qname.lower()]
-        if qpos:
-            cand = cand[cand["pos"].str.upper() == qpos]
-        if cand.empty:
-            cand = players[players["player"].str.lower().str.contains(qname.lower())]
-            if qpos:
-                cand = cand[cand["pos"].str.upper() == qpos]
-        cand = cand[~cand["player_id"].isin([d["player_id"] for d in st.session_state.drafted])]
-        if cand.empty:
-            st.warning("No matching available player found.")
-        else:
-            row = cand.sort_values(["overall_approx", "pos_rank"]).iloc[0]
-            mark_drafted(row, picker=quick_picker, method="manual")
-            st.success(f"Drafted: {row['player']} ({row['pos']})")
-with qc4:
-    st.write("\n")
-    if st.button("↩️ Undo last pick"):
-        undo_last_pick()
-        st.info("Last pick undone.")
+T0, T1, T2, T3, T4 = st.tabs(["🏟️ League Setup", "⭐ Best Available", "📊 By Position", "🧾 Draft Board", "📌 Queue & Search"])
 
-st.write("<span class='small-note'>Tip: Add position in parentheses to disambiguate (e.g., **Kenneth Walker (RB)**). Use the **Load/Save** panel to persist mid-draft.</span>", unsafe_allow_html=True)
+# ---------- Tab 0: League Setup ----------
+with T0:
+    st.subheader("League Setup (Teams, Draft Order, Keeper per team)")
+    teams = st.session_state.league["teams"]
+    df_init = pd.DataFrame({
+        "slot": [t["slot"] for t in teams],
+        "team_name": [t["team_name"] for t in teams],
+        "keeper": [t["keeper_text"] for t in teams],
+    })
 
+    st.caption("Fill in team names and (optionally) each team's keeper as `Name` or `Name (POS)`.")
+    edited = st.data_editor(
+        df_init,
+        num_rows="dynamic",
+        use_container_width=True,
+        height=420,
+        column_config={
+            "slot": st.column_config.NumberColumn("Draft Slot", min_value=1, max_value=24, step=1, help="1 = first pick"),
+            "team_name": st.column_config.TextColumn("Team Name"),
+            "keeper": st.column_config.TextColumn("Keeper (optional)")
+        },
+    )
 
-# Tabs
-T1, T2, T3, T4 = st.tabs(["⭐ Best Available", "📊 By Position", "🧾 Draft Board", "📌 Queue & Search"])
+    cA, cB, cC = st.columns([1,1,1])
+    with cA:
+        if st.button("Apply league & keepers"):
+            apply_league_setup(edited)
+            st.success("League updated. Keepers placed at Pick 0 placeholders. Any matched keepers are now locked and removed from availability.")
+    with cB:
+        if st.button("Clear keepers (placeholders stay)"):
+            # Remove pick 0 rows and re-add placeholders without keeper
+            for t in st.session_state.league["teams"]:
+                t["keeper_text"] = ""
+                t["keeper_pid"] = None
+            st.session_state.drafted = [p for p in st.session_state.drafted if p.get("pick_no", 0) != 0]
+            for t in sorted(st.session_state.league["teams"], key=lambda x: x["slot"]):
+                st.session_state.drafted.append({
+                    "pick_no": 0,
+                    "player_id": None,
+                    "player": "— TBD —",
+                    "team": "",
+                    "pos": "",
+                    "picker": t["team_name"],
+                    "method": "keeper",
+                })
+            st.success("Keepers cleared.")
+    with cC:
+        st.info("Note: Pick 0 rows are non-removable and always on top of the Draft Board.")
+
+# ---------- Helper: View/Filters ----------
+PLAYER_COLUMNS_VIEW = ["player", "team", "pos", "pos_rank", "bye"]
 
 # ---------- Tab 1: Best Available ----------
 with T1:
     st.subheader("Best Available (All Positions)")
-    hide_drafted = st.toggle("Hide drafted", value=True)
-    limit = st.slider("Rows to show", min_value=25, max_value=400, step=25, value=100)
+    hide_drafted = st.toggle("Hide drafted", value=True, key="hide_drafted_all")
+    limit = st.slider("Rows to show", min_value=25, max_value=400, step=25, value=100, key="limit_all")
 
     df = players.copy()
+    dids = drafted_ids_set()
     if hide_drafted:
-        drafted_ids = {d["player_id"] for d in st.session_state.drafted}
-        df = df[~df["player_id"].isin(drafted_ids)]
+        df = df[~df["player_id"].isin(dids)]
 
-    # Decorate with queue flag
-    df["queued"] = df["player_id"].isin(st.session_state.queue)
+    view = df[["player", "team", "pos", "pos_rank", "bye"]].head(limit).reset_index(drop=True)
+    st.dataframe(view, use_container_width=True, height=520)
 
-    view_cols = ["player", "team", "pos", "pos_rank", "bye", "queued"]
-    view = df[view_cols].head(limit).reset_index(drop=True)
-    st.dataframe(view, use_container_width=True, height=500)
-
-    # Queue management
-    st.markdown("**Queue actions**")
-    cqa1, cqa2 = st.columns(2)
-    with cqa1:
-        add_names = st.text_input("Add to queue (comma-separated names)", placeholder="e.g., Jahmyr Gibbs, Sam LaPorta")
-        if st.button("Add to queue") and add_names.strip():
-            new_names = [n.strip() for n in add_names.split(",") if n.strip()]
-            added = 0
-            for nm in new_names:
-                cand = players[players["player"].str.lower() == nm.lower()]
-                if cand.empty:
-                    cand = players[players["player"].str.lower().str.contains(nm.lower())]
-                cand = cand[~cand["player_id"].isin([d["player_id"] for d in st.session_state.drafted])]
-                if not cand.empty:
-                    add_to_queue(cand.iloc[0]["player_id"])
-                    added += 1
-            st.success(f"Added {added} to queue.")
-    with cqa2:
-        rem_names = st.text_input("Remove from queue (comma-separated names)")
-        if st.button("Remove from queue") and rem_names.strip():
-            del_names = [n.strip() for n in rem_names.split(",") if n.strip()]
-            removed = 0
-            for nm in del_names:
-                cand = players[players["player"].str.lower().str.contains(nm.lower())]
-                for pid in cand["player_id"].tolist():
-                    if pid in st.session_state.queue:
-                        remove_from_queue(pid)
-                        removed += 1
-            st.info(f"Removed {removed} from queue.")
-
+    st.caption("Matched keepers (Pick 0) are removed from this list automatically.")
 
 # ---------- Tab 2: By Position ----------
 with T2:
@@ -478,17 +468,10 @@ with T2:
     df = players.copy()
     if pos_choice != "ALL":
         df = df[df["pos"] == pos_choice]
+    dids = drafted_ids_set()
+    df = df[~df["player_id"].isin(dids)]
 
-    drafted_ids = {d["player_id"] for d in st.session_state.drafted}
-    df["drafted"] = df["player_id"].isin(drafted_ids)
-    df["queued"] = df["player_id"].isin(st.session_state.queue)
-
-    show_drafted = st.checkbox("Show drafted players in table", value=False)
-    view_df = df if show_drafted else df[~df["drafted"]]
-
-    # Editable selection column
-    edit_cols = ["player", "team", "pos", "pos_rank", "bye", "queued"]
-    view_df = view_df[edit_cols].copy()
+    view_df = df[["player", "team", "pos", "pos_rank", "bye"]].copy()
     view_df.insert(0, "Select", False)
 
     edited = st.data_editor(
@@ -496,77 +479,87 @@ with T2:
         use_container_width=True,
         height=520,
         column_config={
-            "Select": st.column_config.CheckboxColumn(help="Select players to draft"),
-            "queued": st.column_config.CheckboxColumn(help="Starred in your queue (toggle in 'Queue & Search')")
+            "Select": st.column_config.CheckboxColumn(help="Select players to draft")
         },
-        disabled=["player", "team", "pos", "pos_rank", "bye", "queued"],
+        disabled=["player", "team", "pos", "pos_rank", "bye"],
         hide_index=True,
     )
 
-    # Map edited rows back to base df by (player, pos)
-    to_draft = []
-    for _, row in edited.iterrows():
-        if row.get("Select"):
-            # Find matching row in base df
-            base = players[(players["player"] == row["player"]) & (players["pos"] == row["pos"])]
+    to_draft_rows = []
+    for _, r in edited.iterrows():
+        if r.get("Select"):
+            base = players[(players["player"] == r["player"]) & (players["pos"] == r["pos"])].head(1)
             if not base.empty:
-                to_draft.append(base.iloc[0])
+                to_draft_rows.append(base.iloc[0])
 
-    st.write("")
     colA, colB = st.columns([1,1])
     with colA:
-        picker = st.text_input("Picker label for selected rows", value=st.session_state.default_picker, key="picker_bypos")
+        picker = st.text_input("Picker label for selected rows (ignored if Auto-assign on)", value="Other Team", key="picker_bypos")
     with colB:
         if st.button("Draft selected players"):
-            if not to_draft:
+            if not to_draft_rows:
                 st.warning("No players selected.")
             else:
-                drafted_now = 0
-                for base_row in to_draft:
-                    if not is_drafted(base_row["player_id"]):
-                        mark_drafted(base_row, picker=picker, method="manual")
-                        drafted_now += 1
-                if drafted_now:
-                    st.success(f"Drafted {drafted_now} player(s).")
-
+                cnt = 0
+                for base_row in to_draft_rows:
+                    mk_picker = None if st.session_state.league.get("auto_assign_picker", False) else picker
+                    mark_drafted(base_row, picker=mk_picker, method="manual")
+                    cnt += 1
+                st.success(f"Drafted {cnt} player(s).")
 
 # ---------- Tab 3: Draft Board ----------
 with T3:
     st.subheader("Draft Board")
+
+    # Draft order panel
+    teams_sorted = sorted(st.session_state.league["teams"], key=lambda t: t["slot"])
+
+    st.markdown("**Draft Order (Slot → Team):** " + ", ".join([f"{t['slot']}: {t['team_name']}" for t in teams_sorted]))
+    st.caption("Auto-assign picker uses this order (snake if enabled). Keepers are locked at Pick 0 and listed below.")
+
     if not st.session_state.drafted:
         st.info("No picks yet. Use the other tabs to draft players.")
     else:
         board = pd.DataFrame(st.session_state.drafted)
-        board = board.sort_values("pick_no").reset_index(drop=True)
+        board = board.sort_values(["pick_no", "picker"]).reset_index(drop=True)
+        # Render: keepers (pick 0) on top
         board["Pick"] = board["pick_no"]
-        board = board[["Pick", "player", "team", "pos", "picker", "method"]]
-        st.dataframe(board, use_container_width=True, height=520)
+        board_display = board[["Pick", "player", "team", "pos", "picker", "method"]]
+        st.dataframe(board_display, use_container_width=True, height=520)
 
-    d1, d2 = st.columns([1,1])
+    d1, d2, d3 = st.columns([1,1,1])
     with d1:
-        if st.button("↩️ Undo last pick (here)"):
+        if st.button("↩️ Undo last pick"):
             undo_last_pick()
-            st.info("Last pick undone.")
+            st.info("Last non-keeper pick undone.")
     with d2:
         csv = pd.DataFrame(st.session_state.drafted).to_csv(index=False)
         st.download_button("Download board CSV", data=csv, file_name="draft_board.csv", mime="text/csv")
-
+    with d3:
+        # Quick draft controls
+        qname = st.text_input("Quick draft by name (opt. 'Name (POS)')", key="quick_name")
+        if st.button("➕ Draft by name") and qname.strip():
+            name, pos = parse_name_pos(qname)
+            row = find_available_player(name, pos)
+            if row is None:
+                st.warning("No matching available player found.")
+            else:
+                mk_picker = None if st.session_state.league.get("auto_assign_picker", False) else st.text_input("Picker override", value="Other Team", key="picker_override")
+                mark_drafted(row, picker=mk_picker, method="manual")
+                st.success(f"Drafted: {row['player']} ({row['pos']})")
 
 # ---------- Tab 4: Queue & Search ----------
 with T4:
     st.subheader("Queue & Search")
-
-    qcol1, qcol2 = st.columns([2,1])
-    with qcol1:
-        q = st.text_input("Search players (name contains)", placeholder="e.g., 'waddle' or 'Bengals WR'")
-    with qcol2:
+    q1, q2 = st.columns([2,1])
+    with q1:
+        q = st.text_input("Search players (name, team, or pos contains)", placeholder="e.g., 'bengals wr' or 'gibbs'")
+    with q2:
         only_available = st.toggle("Only available", value=True)
 
     df = players.copy()
     if q.strip():
-        ql = q.lower()
-        # Support simple filters like "bengals wr"
-        tokens = ql.split()
+        tokens = q.lower().split()
         mask = pd.Series([True] * len(df))
         for t in tokens:
             mask = mask & (
@@ -576,42 +569,11 @@ with T4:
             )
         df = df[mask]
 
-    drafted_ids = {d["player_id"] for d in st.session_state.drafted}
     if only_available:
-        df = df[~df["player_id"].isin(drafted_ids)]
+        df = df[~df["player_id"].isin(drafted_ids_set())]
 
-    df["queued"] = df["player_id"].isin(st.session_state.queue)
+    st.dataframe(df[["player", "team", "pos", "pos_rank", "bye"]].head(400).reset_index(drop=True), use_container_width=True, height=520)
 
-    view_cols = ["player", "team", "pos", "pos_rank", "bye", "queued"]
-    st.dataframe(df[view_cols].head(400).reset_index(drop=True), use_container_width=True, height=520)
-
-    st.markdown("**Queue quick actions**")
-    qqa1, qqa2 = st.columns(2)
-    with qqa1:
-        nm = st.text_input("Add 1 player to queue")
-        if st.button("Add to queue (1)") and nm.strip():
-            cand = players[players["player"].str.lower().str.contains(nm.lower())]
-            cand = cand[~cand["player_id"].isin(drafted_ids)]
-            if not cand.empty:
-                add_to_queue(cand.iloc[0]["player_id"])
-                st.success("Added to queue.")
-            else:
-                st.warning("No available match.")
-    with qqa2:
-        nm2 = st.text_input("Remove 1 from queue")
-        if st.button("Remove from queue (1)") and nm2.strip():
-            cand = players[players["player"].str.lower().str.contains(nm2.lower())]
-            removed = 0
-            for pid in cand["player_id"].tolist():
-                if pid in st.session_state.queue:
-                    remove_from_queue(pid)
-                    removed += 1
-            if removed:
-                st.info(f"Removed {removed}.")
-            else:
-                st.warning("No queued match.")
-
-
-# Footer hint
+# Footer
 st.write("\n")
-st.caption("Built for manual-board drafts: track keepers, hide taken players, and always see the best available.")
+st.caption("League-aware. Keepers locked at Pick 0. Use auto-assign picker for rapid-fire drafting.")
