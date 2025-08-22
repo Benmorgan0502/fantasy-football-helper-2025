@@ -67,7 +67,6 @@ POS_FILES = {
 
 SEARCH_DIRS = [".", "./data", "./Data", "./datasets", "./rankings"]
 
-
 def _find_first_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     cols_lower = [c.lower().strip() for c in cols]
     for cand in candidates:
@@ -75,14 +74,12 @@ def _find_first_col(cols: List[str], candidates: List[str]) -> Optional[str]:
             return cols[cols_lower.index(cand)]
     return None
 
-
 def _coalesce_columns(df: pd.DataFrame, wanted: List[str], new_name: str) -> Optional[str]:
     col = _find_first_col(list(df.columns), wanted)
     if col and col != new_name:
         df.rename(columns={col: new_name}, inplace=True)
         return new_name
     return col
-
 
 def _safe_read_csv(path: str) -> Optional[pd.DataFrame]:
     try:
@@ -92,7 +89,6 @@ def _safe_read_csv(path: str) -> Optional[pd.DataFrame]:
             return pd.read_csv(path, encoding="latin-1")
         except Exception:
             return None
-
 
 def discover_files() -> Dict[str, str]:
     found = {}
@@ -104,7 +100,6 @@ def discover_files() -> Dict[str, str]:
                 break
     return found
 
-
 def normalize_one_position(path: str, pos: str) -> pd.DataFrame:
     raw = _safe_read_csv(path)
     if raw is None or raw.empty:
@@ -113,9 +108,9 @@ def normalize_one_position(path: str, pos: str) -> pd.DataFrame:
     df = raw.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    name_col = _coalesce_columns(df, NAME_COLS, "player")
-    team_col = _coalesce_columns(df, TEAM_COLS, "team")
-    bye_col  = _coalesce_columns(df, BYE_COLS,  "bye")
+    _coalesce_columns(df, NAME_COLS, "player")
+    _coalesce_columns(df, TEAM_COLS, "team")
+    _coalesce_columns(df, BYE_COLS,  "bye")
 
     df["pos"] = pos
     df["source_file"] = os.path.basename(path)
@@ -148,7 +143,6 @@ def normalize_one_position(path: str, pos: str) -> pd.DataFrame:
     df = df[df["player"].str.len() > 0].copy()
     return df
 
-
 def load_all_positions(files: Dict[str, str]) -> pd.DataFrame:
     frames = []
     for pos, path in files.items():
@@ -177,7 +171,6 @@ def load_all_positions(files: Dict[str, str]) -> pd.DataFrame:
 # ----------------------------
 # Session State & League Model
 # ----------------------------
-
 def init_state():
     if "players" not in st.session_state:
         files = discover_files()
@@ -200,13 +193,10 @@ def init_state():
 init_state()
 players: pd.DataFrame = st.session_state.players
 
-# Utility: map -> drafted set
-
 def drafted_ids_set() -> set:
     return {d["player_id"] for d in st.session_state.drafted if d.get("player_id")}
 
-# Keeper matching & application
-
+# ----- Keeper matching & application -----
 def parse_name_pos(s: str) -> Tuple[str, Optional[str]]:
     m = re.match(r"^(.*?)(\s*\((QB|RB|WR|TE|DST|K)\))?$", s.strip(), flags=re.I)
     if not m:
@@ -215,10 +205,8 @@ def parse_name_pos(s: str) -> Tuple[str, Optional[str]]:
     pos = (m.group(3) or None)
     return name, (pos.upper() if pos else None)
 
-
 def find_available_player(name: str, pos: Optional[str]) -> Optional[pd.Series]:
     df = players.copy()
-    # exclude already drafted
     df = df[~df["player_id"].isin(drafted_ids_set())]
     cand = df[df["player"].str.lower() == name.lower()]
     if pos:
@@ -229,28 +217,24 @@ def find_available_player(name: str, pos: Optional[str]) -> Optional[pd.Series]:
             cand = cand[cand["pos"].str.upper() == pos]
     if cand.empty:
         return None
-    row = cand.sort_values(["overall_approx", "pos_rank"]).iloc[0]
-    return row
+    return cand.sort_values(["overall_approx", "pos_rank"]).iloc[0]
 
-# Draft mechanics
-
+# ----- Draft mechanics -----
 def is_drafted(player_id: str) -> bool:
     return any(p.get("player_id") == player_id for p in st.session_state.drafted)
 
-
 def compute_picker_for_pick(pick_no: int) -> str:
-    teams = sorted(st.session_state.league["teams"], key=lambda t: t["slot"])  # in slot order
+    teams = sorted(st.session_state.league["teams"], key=lambda t: t["slot"])
     N = len(teams)
     if N == 0:
         return "Other Team"
-    round_idx = (pick_no - 1) // N  # 0-based
+    round_idx = (pick_no - 1) // N
     idx_in_round = (pick_no - 1) % N
     if st.session_state.league.get("snake", True) and (round_idx % 2 == 1):
         team = teams[::-1][idx_in_round]
     else:
         team = teams[idx_in_round]
     return team.get("team_name", f"Team {idx_in_round+1}")
-
 
 def mark_drafted(row: pd.Series, picker: Optional[str] = None, method: str = "manual", pick_no: Optional[int] = None):
     pid = row["player_id"]
@@ -272,24 +256,19 @@ def mark_drafted(row: pd.Series, picker: Optional[str] = None, method: str = "ma
     if pick_no > 0:
         st.session_state.pick_no = max(st.session_state.pick_no, pick_no + 1)
 
-
 def undo_last_pick():
     # Do not remove keeper placeholders or keeper picks at pick 0
     while st.session_state.drafted:
         last = st.session_state.drafted[-1]
         if last.get("pick_no", 0) == 0:
-            # keepers are locked — skip
             st.session_state.drafted.pop()
-            # reinsert at beginning to maintain order
-            st.session_state.drafted.insert(0, last)
+            st.session_state.drafted.insert(0, last)  # keep keepers locked at top
             break
         st.session_state.drafted.pop()
-        # adjust counter
         st.session_state.pick_no = max(1, last.get("pick_no", 1))
         break
 
-# Save / Load
-
+# ----- Save / Load -----
 def save_state_json() -> str:
     payload = {
         "drafted": st.session_state.drafted,
@@ -297,7 +276,6 @@ def save_state_json() -> str:
         "league": st.session_state.league,
     }
     return json.dumps(payload, indent=2)
-
 
 def load_state_json(text: str):
     data = json.loads(text)
@@ -309,7 +287,6 @@ def load_state_json(text: str):
 # ----------------------------
 # Apply League Setup & Keepers
 # ----------------------------
-
 def apply_league_setup(teams_df: pd.DataFrame):
     # Update league teams
     teams = []
@@ -320,18 +297,17 @@ def apply_league_setup(teams_df: pd.DataFrame):
             "keeper_text": str(r.get("keeper", "")).strip(),
             "keeper_pid": None,
         })
-    teams.sort(key=lambda t: t["slot"])  # ensure order
+    teams.sort(key=lambda t: t["slot"])
     st.session_state.league["teams"] = teams
 
-    # Build/refresh keeper placeholders at pick 0 (one per team)
-    # Strategy: remove any existing pick_no==0 rows, then recreate from teams
+    # Clear any existing pick 0 rows
     st.session_state.drafted = [p for p in st.session_state.drafted if p.get("pick_no", 0) != 0]
 
-    # Add placeholders first
+    # Add fresh placeholders
     for t in teams:
         st.session_state.drafted.append({
             "pick_no": 0,
-            "player_id": None,  # placeholder until assigned
+            "player_id": None,
             "player": "— TBD —" if not t["keeper_text"] else t["keeper_text"],
             "team": "",
             "pos": "",
@@ -339,17 +315,16 @@ def apply_league_setup(teams_df: pd.DataFrame):
             "method": "keeper",
         })
 
-    # Then, for any team with a keeper name, try to match & lock at pick 0
-    for idx, t in enumerate(teams):
+    # Try to resolve and lock any provided keepers
+    for t in teams:
         kt = t["keeper_text"].strip()
         if not kt:
             continue
         name, pos = parse_name_pos(kt)
         row = find_available_player(name, pos)
         if row is None:
-            continue  # leave placeholder text, not drafted
-        # assign to the placeholder record for this team (the nth pick 0 row with same picker)
-        # find the first matching placeholder for picker with player_id None
+            continue
+        # assign to that team's pick 0 placeholder
         for p in st.session_state.drafted:
             if p.get("pick_no") == 0 and p.get("picker") == t["team_name"] and p.get("player_id") is None:
                 p.update({
@@ -441,9 +416,6 @@ with T0:
     with cC:
         st.info("Note: Pick 0 rows are non-removable and always on top of the Draft Board.")
 
-# ---------- Helper: View/Filters ----------
-PLAYER_COLUMNS_VIEW = ["player", "team", "pos", "pos_rank", "bye"]
-
 # ---------- Tab 1: Best Available ----------
 with T1:
     st.subheader("Best Available (All Positions)")
@@ -513,16 +485,13 @@ with T3:
 
     # Draft order panel
     teams_sorted = sorted(st.session_state.league["teams"], key=lambda t: t["slot"])
-
     st.markdown("**Draft Order (Slot → Team):** " + ", ".join([f"{t['slot']}: {t['team_name']}" for t in teams_sorted]))
     st.caption("Auto-assign picker uses this order (snake if enabled). Keepers are locked at Pick 0 and listed below.")
 
     if not st.session_state.drafted:
         st.info("No picks yet. Use the other tabs to draft players.")
     else:
-        board = pd.DataFrame(st.session_state.drafted)
-        board = board.sort_values(["pick_no", "picker"]).reset_index(drop=True)
-        # Render: keepers (pick 0) on top
+        board = pd.DataFrame(st.session_state.drafted).sort_values(["pick_no", "picker"]).reset_index(drop=True)
         board["Pick"] = board["pick_no"]
         board_display = board[["Pick", "player", "team", "pos", "picker", "method"]]
         st.dataframe(board_display, use_container_width=True, height=520)
@@ -536,7 +505,6 @@ with T3:
         csv = pd.DataFrame(st.session_state.drafted).to_csv(index=False)
         st.download_button("Download board CSV", data=csv, file_name="draft_board.csv", mime="text/csv")
     with d3:
-        # Quick draft controls
         qname = st.text_input("Quick draft by name (opt. 'Name (POS)')", key="quick_name")
         if st.button("➕ Draft by name") and qname.strip():
             name, pos = parse_name_pos(qname)
